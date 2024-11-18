@@ -1,0 +1,298 @@
+
+"""
+@author: BehRaD
+"""
+# Restart the Spyder kernel
+from IPython import get_ipython
+
+ipython = get_ipython()
+ipython.magic('reset -f')  # Clear all variables
+# ipython.magic('clear')     # Clear the console (optional)
+ 
+
+
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+from PIL import Image
+
+import random
+import os
+
+def set_seed(seed):
+    # Set Python random seed
+    random.seed(seed)
+    
+    # Set Numpy random seed
+    np.random.seed(seed)
+    
+    # Set TensorFlow random seed
+    tf.random.set_seed(seed)
+    
+    # Ensure reproducibility in TensorFlow operations (especially on GPU)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'
+    os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
+
+
+
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+        print(f"{len(gpus)} Physical GPUs, {len(logical_gpus)} Logical GPUs")
+    except RuntimeError as e:
+        print(e)
+
+
+
+def crop_and_concat(upsampled, bypass):
+    """Pad `upsampled` to match the size of `bypass` and concatenate."""
+    def dynamic_padding(inputs):
+        upsampled, bypass = inputs
+        
+        # Get the shapes of the upsampled and bypass tensors
+        u_shape = tf.shape(upsampled)
+        b_shape = tf.shape(bypass)
+        
+        # Calculate the differences in height and width
+        diff_h = b_shape[1] - u_shape[1]
+        diff_w = b_shape[2] - u_shape[2]
+        
+        # Ensure padding values are non-negative
+        pad_h1 = tf.maximum(diff_h // 2, 0)
+        pad_h2 = tf.maximum(diff_h - pad_h1, 0)
+        pad_w1 = tf.maximum(diff_w // 2, 0)
+        pad_w2 = tf.maximum(diff_w - pad_w1, 0)
+        
+        # Apply the padding dynamically
+        upsampled_padded = tf.pad(upsampled, [[0, 0], [pad_h1, pad_h2], [pad_w1, pad_w2], [0, 0]])
+        return upsampled_padded
+
+    # Use Lambda layer to apply the dynamic padding
+    upsampled_padded = layers.Lambda(dynamic_padding)([upsampled, bypass])
+    
+    # Concatenate the padded upsampled tensor with the bypass tensor
+    return layers.concatenate([upsampled_padded, bypass], axis=3)
+
+# U-Net Architecture
+def build_unet(input_shape):
+    inputs = layers.Input(shape=input_shape)
+    
+    # Encoder (downsampling path)
+    # Encoder
+    c1 = layers.Conv2D(64, 3, activation='relu', padding='same')(inputs)
+    c1 = layers.Conv2D(64, 3, activation='relu', padding='same')(c1)
+    p1 = layers.MaxPooling2D(pool_size=(2, 2))(c1)
+    
+    c2 = layers.Conv2D(128, 3, activation='relu', padding='same')(p1)
+    c2 = layers.Conv2D(128, 3, activation='relu', padding='same')(c2)
+    p2 = layers.MaxPooling2D(pool_size=(2, 2))(c2)
+    
+    c3 = layers.Conv2D(256, 3, activation='relu', padding='same')(p2)
+    c3 = layers.Conv2D(256, 3, activation='relu', padding='same')(c3)
+    p3 = layers.MaxPooling2D(pool_size=(2, 2))(c3)
+    
+    c4 = layers.Conv2D(512, 3, activation='relu', padding='same')(p3)
+    c4 = layers.Conv2D(512, 3, activation='relu', padding='same')(c4)
+    p4 = layers.MaxPooling2D(pool_size=(2, 2))(c4)
+    
+    c5 = layers.Conv2D(1024, 3, activation='relu', padding='same')(p4)
+    c5 = layers.Conv2D(1024, 3, activation='relu', padding='same')(c5)
+    
+    # Decoder
+    u6 = layers.Conv2DTranspose(512, (2, 2), strides=(2, 2), padding='same')(c5)
+    u6 = crop_and_concat(u6, c4)
+    c6 = layers.Conv2D(512, 3, activation='relu', padding='same')(u6)
+    c6 = layers.Conv2D(512, 3, activation='relu', padding='same')(c6)
+    
+    u7 = layers.Conv2DTranspose(256, (2, 2), strides=(2, 2), padding='same')(c6)
+    u7 = crop_and_concat(u7, c3)  # Ensure correct shape
+    c7 = layers.Conv2D(256, 3, activation='relu', padding='same')(u7)
+    c7 = layers.Conv2D(256, 3, activation='relu', padding='same')(c7)
+    
+    u8 = layers.Conv2DTranspose(128, (2, 2), strides=(2, 2), padding='same')(c7)
+    u8 = crop_and_concat(u8, c2)  # Ensure correct shape
+    c8 = layers.Conv2D(128, 3, activation='relu', padding='same')(u8)
+    c8 = layers.Conv2D(128, 3, activation='relu', padding='same')(c8)
+    
+    u9 = layers.Conv2DTranspose(64, (2, 2), strides=(2, 2), padding='same')(c8)
+    u9 = crop_and_concat(u9, c1)  # Ensure correct shape
+    c9 = layers.Conv2D(64, 3, activation='relu', padding='same')(u9)
+    c9 = layers.Conv2D(64, 3, activation='relu', padding='same')(c9)
+    
+    outputs = layers.Conv2D(1, 1, activation='sigmoid')(c9)
+    
+    model = Model(inputs=[inputs], outputs=[outputs])
+    return model
+
+# Helper function to create patches from large images
+def create_patches(image, patch_size=250):
+    h, w, _ = image.shape
+    patches = []
+    for i in range(0, h, patch_size):
+        for j in range(0, w, patch_size):
+            patch = image[i:i+patch_size, j:j+patch_size]
+            if patch.shape[0] == patch_size and patch.shape[1] == patch_size:
+                patches.append(patch)
+    return np.array(patches)
+
+# Helper function to stitch heatmaps into a full image
+from scipy.ndimage import zoom
+def stitch_heatmaps(heatmaps, image_shape, patch_size=250):
+    h, w = image_shape
+    full_heatmap = np.zeros((h, w))
+    idx = 0
+    for i in range(0, h, patch_size):
+        for j in range(0, w, patch_size):
+            # Apply bicubic interpolation (zoom) for smoother patch integration
+            interpolated_patch = zoom(heatmaps[idx], 
+                                      (patch_size / heatmaps[idx].shape[0], 
+                                       patch_size / heatmaps[idx].shape[1]), 
+                                      order=3)
+            full_heatmap[i:i+patch_size, j:j+patch_size] = interpolated_patch
+            idx += 1
+    return full_heatmap
+
+# Generate heatmaps for patch differences
+def generate_heatmap(diff_vector, patch_size=, threshold=0.5):
+    heatmap = np.abs(diff_vector)
+    
+    # Reshape the difference vector into a 2D patch (patch_size x patch_size)
+    heatmap = np.reshape(heatmap, (patch_size, patch_size))
+    
+    # Normalize the heatmap to the range [0, 1]
+    heatmap = (heatmap - np.min(heatmap)) / (np.max(heatmap) - np.min(heatmap) + 1e-10)
+    
+    # Apply threshold to create binary black-and-white heatmap
+    binary_heatmap = np.where(heatmap > threshold, 1, 0)  # 1 for significant difference, 0 for none
+    
+    return binary_heatmap
+
+# One-shot comparison of two large images using U-Net in Siamese
+def compare_images(image_A, image_B, patch_size=, threshold=0.5):
+    h, w, _ = image_A.shape
+
+    # Create patches from both images
+    patches_A = create_patches(image_A, patch_size)
+    patches_B = create_patches(image_B, patch_size)
+    
+    # Build the U-Net as the Siamese feature extractor
+    input_shape = (patch_size, patch_size, 3)
+    unet_model = build_unet(input_shape)
+    
+    # Extract feature embeddings for each patch using U-Net
+    embeddings_A = unet_model.predict(patches_A)
+    embeddings_B = unet_model.predict(patches_B)
+    
+    # Compare embeddings and generate black-and-white heatmaps
+    heatmaps = []
+    for i in range(len(embeddings_A)):
+        diff_vector = embeddings_A[i] - embeddings_B[i]
+        heatmap = generate_heatmap(diff_vector, patch_size, threshold)
+        heatmaps.append(heatmap)
+    
+    # Stitch all patch heatmaps into one large heatmap
+    full_heatmap = stitch_heatmaps(heatmaps, image_A.shape[:2], patch_size)
+    
+    return full_heatmap
+
+# Visualization function to show heatmap overlayed on image
+
+def resize_heatmap(heatmap, target_size=(, )):
+    resized_heatmap = cv2.resize(heatmap, target_size, interpolation=cv2.INTER_AREA)
+    return resized_heatmap
+
+def resize_image(image, target_size=(, )):
+    # Resize the image to a smaller size (e.g., 1000x1000) for visualization
+    resized_image = cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
+    return resized_image
+
+
+def visualize_heatmap(image, heatmap, alpha=0.5, dpi=300):
+    
+    resized_image_A = resize_image(image, target_size=(, ))
+    resized_heatmap = resize_heatmap(heatmap, target_size=(, ))
+
+    
+    
+    plt.figure(figsize=(20, 20), dpi=dpi)
+    
+    # Show the original image in grayscale
+    plt.imshow(resized_image_A, cmap='gray')
+    
+    # Overlay the heatmap using a gradient colormap (e.g., 'hot', 'jet')
+    plt.imshow(resized_heatmap, cmap='hot', alpha=alpha)  # Use a gradient colormap
+    
+    plt.colorbar()  # Optionally show a colorbar to indicate intensity
+    plt.axis('off')  # Turn off axis to focus on the image
+    
+    plt.show()
+    
+    
+    plt.figure(figsize=(20, 20), dpi=dpi)
+    plt.imshow(resized_heatmap, cmap='gray')  # Display the mask in grayscale (1 for changed, 0 for unchanged)
+    plt.axis('off')  # Hide the axis
+    plt.show() 
+
+# Example usage
+__name__ = "__main__"
+  
+if __name__ == "__main__":
+    # Load two large images
+    image_A = cv2.imread()  # file path
+    image_B = cv2.imread()  # file path
+  
+    
+    
+    # Ensure the images are in RGB format
+    image_A = cv2.cvtColor(image_A, cv2.COLOR_BGR2RGB)
+    image_B = cv2.cvtColor(image_B, cv2.COLOR_BGR2RGB)
+
+    # Parameters
+    patch_size = 250
+
+    # Create patches from both images
+    patches_A = create_patches(image_A, patch_size)
+    patches_B = create_patches(image_B, patch_size)
+
+    # Build the U-Net model
+    input_shape = (patch_size, patch_size, 3)
+    unet_model = build_unet(input_shape)
+
+    # Extract feature embeddings for each patch using U-Net
+    embeddings_A = unet_model.predict(patches_A)
+    embeddings_B = unet_model.predict(patches_B)
+
+    # Compare embeddings and generate heatmaps
+    heatmaps = []
+    for i in range(len(embeddings_A)):
+        diff_vector = np.abs(embeddings_A[i] - embeddings_B[i])
+        heatmap = generate_heatmap(diff_vector, patch_size)
+        heatmaps.append(heatmap)
+    
+    # Stitch all patch heatmaps into one large heatmap
+    full_heatmap = stitch_heatmaps(heatmaps, image_A.shape[:2], patch_size)
+
+    # Visualize the heatmap over the original image
+    visualize_heatmap(image_A, full_heatmap)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
