@@ -1,106 +1,125 @@
-
+# siamese_unet_rgb.py
 """
-@author: BehRaD
+Siamese Network with U-Net Architecture for RGB Image Difference Detection
+
+This implementation processes RGB images to detect differences using a Siamese network
+with U-Net architecture. It supports multiple clustering methods (K-means, DBSCAN, GMM, AGG)
+and generates heatmaps to visualize differences.
+
+Author: Behrad
+License: MIT
 """
-# Restart the Spyder kernel
-from IPython import get_ipython
-
-ipython = get_ipython()
-ipython.magic('reset -f')  # Clear all variables
-# ipython.magic('clear')     # Clear the console (optional)
- 
-
 
 import tensorflow as tf
 from tensorflow.keras import layers, Model
 import numpy as np
 import matplotlib.pyplot as plt
 import cv2
-from PIL import Image
-
+from scipy.ndimage import zoom
 import random
 import os
+import argparse
+from typing import Tuple, List
+from dataclasses import dataclass
 
-def set_seed(seed):
-    # Set Python random seed
+@dataclass
+class Config:
+    """Configuration class for model parameters."""
+    patch_size: int = 200
+    threshold: float = 0.01
+    target_size: Tuple[int, int] = (5000, 5000)
+    min_area: int = 50
+    scale_factor: float = 0.5
+    seed: int = 42
+    memory_limit: int = 4096  # GPU memory limit in MB
+
+def set_seed(seed: int) -> None:
+    """Set random seeds for reproducibility."""
     random.seed(seed)
-    
-    # Set Numpy random seed
     np.random.seed(seed)
-    
-    # Set TensorFlow random seed
     tf.random.set_seed(seed)
-    
-    # Ensure reproducibility in TensorFlow operations (especially on GPU)
     os.environ['PYTHONHASHSEED'] = str(seed)
     os.environ['TF_DETERMINISTIC_OPS'] = '1'
     os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
 
+def configure_gpu(config: Config) -> None:
+    """Configure GPU memory growth."""
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.set_logical_device_configuration(
+                    gpu,
+                    [tf.config.LogicalDeviceConfiguration(memory_limit=config.memory_limit)]
+                )
+        except RuntimeError as e:
+            print(f"GPU configuration error: {e}")
 
+def load_and_preprocess_image(file_path: str) -> np.ndarray:
+    """
+    Load and preprocess a .tif image (RGB channels only).
 
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        logical_gpus = tf.config.experimental.list_logical_devices('GPU')
-        print(f"{len(gpus)} Physical GPUs, {len(logical_gpus)} Logical GPUs")
-    except RuntimeError as e:
-        print(e)
+    Args:
+        file_path: Path to the .tif file.
+    Returns:
+        Preprocessed RGB image (float32, 0-1 range).
+    Raises:
+        FileNotFoundError: If image cannot be loaded.
+        ValueError: If image has <3 channels or unsupported data type.
+    """
+    image = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise FileNotFoundError(f"Could not load image from {file_path}")
+    if image.shape[2] < 3:
+        raise ValueError(f"Expected at least 3 channels, got {image.shape[2]}")
+    
+    image = image[:, :, :3]  # Extract RGB
+    if image.dtype == np.uint8:
+        return image.astype(np.float32) / 255.0
+    elif image.dtype == np.uint16:
+        return image.astype(np.float32) / 65535.0
+    elif image.dtype == np.float32:
+        return image
+    else:
+        raise ValueError(f"Unsupported data type: {image.dtype}")
 
-
-
-def crop_and_concat(upsampled, bypass):
-    """Pad `upsampled` to match the size of `bypass` and concatenate."""
+def crop_and_concat(upsampled: tf.Tensor, bypass: tf.Tensor) -> tf.Tensor:
+    """Dynamically pad and concatenate upsampled and bypass layers."""
     def dynamic_padding(inputs):
         upsampled, bypass = inputs
-        
-        # Get the shapes of the upsampled and bypass tensors
-        u_shape = tf.shape(upsampled)
-        b_shape = tf.shape(bypass)
-        
-        # Calculate the differences in height and width
+        u_shape, b_shape = tf.shape(upsampled), tf.shape(bypass)
         diff_h = b_shape[1] - u_shape[1]
         diff_w = b_shape[2] - u_shape[2]
-        
-        # Ensure padding values are non-negative
         pad_h1 = tf.maximum(diff_h // 2, 0)
-        pad_h2 = tf.maximum(diff_h - pad_h1, 0)
+        pad_h2 = tf.maximum(diff_h - diff_h // 2, 0)
         pad_w1 = tf.maximum(diff_w // 2, 0)
-        pad_w2 = tf.maximum(diff_w - pad_w1, 0)
-        
-        # Apply the padding dynamically
-        upsampled_padded = tf.pad(upsampled, [[0, 0], [pad_h1, pad_h2], [pad_w1, pad_w2], [0, 0]])
-        return upsampled_padded
-
-    # Use Lambda layer to apply the dynamic padding
-    upsampled_padded = layers.Lambda(dynamic_padding)([upsampled, bypass])
+        pad_w2 = tf.maximum(diff_w - diff_w // 2, 0)
+        return tf.pad(upsampled, [[0, 0], [pad_h1, pad_h2], [pad_w1, pad_w2], [0, 0]])
     
-    # Concatenate the padded upsampled tensor with the bypass tensor
-    return layers.concatenate([upsampled_padded, bypass], axis=3)
+    return layers.concatenate([layers.Lambda(dynamic_padding)([upsampled, bypass]), bypass], axis=3)
 
-# U-Net Architecture
-def build_unet(input_shape):
+def build_unet(input_shape: Tuple[int, int, int]) -> Model:
+    """Build U-Net model for RGB inputs."""
     inputs = layers.Input(shape=input_shape)
     
-    # Encoder (downsampling path)
     # Encoder
     c1 = layers.Conv2D(64, 3, activation='relu', padding='same')(inputs)
     c1 = layers.Conv2D(64, 3, activation='relu', padding='same')(c1)
-    p1 = layers.MaxPooling2D(pool_size=(2, 2))(c1)
+    p1 = layers.MaxPooling2D((2, 2))(c1)
     
     c2 = layers.Conv2D(128, 3, activation='relu', padding='same')(p1)
     c2 = layers.Conv2D(128, 3, activation='relu', padding='same')(c2)
-    p2 = layers.MaxPooling2D(pool_size=(2, 2))(c2)
+    p2 = layers.MaxPooling2D((2, 2))(c2)
     
     c3 = layers.Conv2D(256, 3, activation='relu', padding='same')(p2)
     c3 = layers.Conv2D(256, 3, activation='relu', padding='same')(c3)
-    p3 = layers.MaxPooling2D(pool_size=(2, 2))(c3)
+    p3 = layers.MaxPooling2D((2, 2))(c3)
     
     c4 = layers.Conv2D(512, 3, activation='relu', padding='same')(p3)
     c4 = layers.Conv2D(512, 3, activation='relu', padding='same')(c4)
-    p4 = layers.MaxPooling2D(pool_size=(2, 2))(c4)
+    p4 = layers.MaxPooling2D((2, 2))(c4)
     
+    # Bottleneck
     c5 = layers.Conv2D(1024, 3, activation='relu', padding='same')(p4)
     c5 = layers.Conv2D(1024, 3, activation='relu', padding='same')(c5)
     
@@ -108,191 +127,176 @@ def build_unet(input_shape):
     u6 = layers.Conv2DTranspose(512, (2, 2), strides=(2, 2), padding='same')(c5)
     u6 = crop_and_concat(u6, c4)
     c6 = layers.Conv2D(512, 3, activation='relu', padding='same')(u6)
-    c6 = layers.Conv2D(512, 3, activation='relu', padding='same')(c6)
     
     u7 = layers.Conv2DTranspose(256, (2, 2), strides=(2, 2), padding='same')(c6)
-    u7 = crop_and_concat(u7, c3)  # Ensure correct shape
+    u7 = crop_and_concat(u7, c3)
     c7 = layers.Conv2D(256, 3, activation='relu', padding='same')(u7)
-    c7 = layers.Conv2D(256, 3, activation='relu', padding='same')(c7)
     
     u8 = layers.Conv2DTranspose(128, (2, 2), strides=(2, 2), padding='same')(c7)
-    u8 = crop_and_concat(u8, c2)  # Ensure correct shape
+    u8 = crop_and_concat(u8, c2)
     c8 = layers.Conv2D(128, 3, activation='relu', padding='same')(u8)
-    c8 = layers.Conv2D(128, 3, activation='relu', padding='same')(c8)
     
     u9 = layers.Conv2DTranspose(64, (2, 2), strides=(2, 2), padding='same')(c8)
-    u9 = crop_and_concat(u9, c1)  # Ensure correct shape
+    u9 = crop_and_concat(u9, c1)
     c9 = layers.Conv2D(64, 3, activation='relu', padding='same')(u9)
-    c9 = layers.Conv2D(64, 3, activation='relu', padding='same')(c9)
     
     outputs = layers.Conv2D(1, 1, activation='sigmoid')(c9)
-    
-    model = Model(inputs=[inputs], outputs=[outputs])
-    return model
+    return Model(inputs, outputs)
 
-# Helper function to create patches from large images
-def create_patches(image, patch_size=250):
+def create_patches(image: np.ndarray, patch_size: int) -> np.ndarray:
+    """Split image into patches."""
     h, w, _ = image.shape
-    patches = []
-    for i in range(0, h, patch_size):
-        for j in range(0, w, patch_size):
-            patch = image[i:i+patch_size, j:j+patch_size]
-            if patch.shape[0] == patch_size and patch.shape[1] == patch_size:
-                patches.append(patch)
+    patches = [
+        image[i:i+patch_size, j:j+patch_size]
+        for i in range(0, h, patch_size)
+        for j in range(0, w, patch_size)
+        if image[i:i+patch_size, j:j+patch_size].shape[:2] == (patch_size, patch_size)
+    ]
     return np.array(patches)
 
-# Helper function to stitch heatmaps into a full image
-from scipy.ndimage import zoom
-def stitch_heatmaps(heatmaps, image_shape, patch_size=250):
+def generate_heatmap(diff_vector: np.ndarray, patch_size: int, threshold: float) -> np.ndarray:
+    """Generate binary heatmap from difference vector."""
+    heatmap = np.reshape(np.abs(diff_vector), (patch_size, patch_size))
+    return np.where(heatmap > threshold, 1, 0)
+
+def stitch_heatmaps(heatmaps: List[np.ndarray], image_shape: Tuple[int, int], patch_size: int) -> np.ndarray:
+    """Stitch patch heatmaps into full image."""
     h, w = image_shape
     full_heatmap = np.zeros((h, w))
     idx = 0
     for i in range(0, h, patch_size):
         for j in range(0, w, patch_size):
-            # Apply bicubic interpolation (zoom) for smoother patch integration
-            interpolated_patch = zoom(heatmaps[idx], 
-                                      (patch_size / heatmaps[idx].shape[0], 
-                                       patch_size / heatmaps[idx].shape[1]), 
-                                      order=3)
-            full_heatmap[i:i+patch_size, j:j+patch_size] = interpolated_patch
+            full_heatmap[i:i+patch_size, j:j+patch_size] = zoom(
+                heatmaps[idx],
+                (patch_size / heatmaps[idx].shape[0], patch_size / heatmaps[idx].shape[1]),
+                order=3
+            )
             idx += 1
     return full_heatmap
 
-# Generate heatmaps for patch differences
-def generate_heatmap(diff_vector, patch_size=, threshold=0.5):
-    heatmap = np.abs(diff_vector)
-    
-    # Reshape the difference vector into a 2D patch (patch_size x patch_size)
-    heatmap = np.reshape(heatmap, (patch_size, patch_size))
-    
-    # Normalize the heatmap to the range [0, 1]
-    heatmap = (heatmap - np.min(heatmap)) / (np.max(heatmap) - np.min(heatmap) + 1e-10)
-    
-    # Apply threshold to create binary black-and-white heatmap
-    binary_heatmap = np.where(heatmap > threshold, 1, 0)  # 1 for significant difference, 0 for none
-    
-    return binary_heatmap
+def apply_connected_components_filter(heatmap: np.ndarray, min_area: int) -> np.ndarray:
+    """Filter heatmap using connected components."""
+    heatmap_uint8 = (heatmap * 255).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(heatmap_uint8, connectivity=8)
+    filtered_heatmap = np.zeros_like(heatmap)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            filtered_heatmap[labels == i] = 1
+    return filtered_heatmap
 
-# One-shot comparison of two large images using U-Net in Siamese
-def compare_images(image_A, image_B, patch_size=, threshold=0.5):
-    h, w, _ = image_A.shape
-
-    # Create patches from both images
-    patches_A = create_patches(image_A, patch_size)
-    patches_B = create_patches(image_B, patch_size)
+def visualize_both_heatmaps(image: np.ndarray, original_heatmap: np.ndarray, 
+                          filtered_heatmap: np.ndarray, target_size: Tuple[int, int]) -> None:
+    """Visualize original and filtered heatmaps over RGB image."""
+    plt.figure(figsize=(20, 10))
     
-    # Build the U-Net as the Siamese feature extractor
-    input_shape = (patch_size, patch_size, 3)
-    unet_model = build_unet(input_shape)
+    plt.subplot(1, 2, 1)
+    plt.title("Original Heatmap")
+    plt.imshow(cv2.resize(image, target_size))
+    plt.imshow(cv2.resize(original_heatmap, target_size), cmap='hot', alpha=0.5)
+    plt.axis("off")
     
-    # Extract feature embeddings for each patch using U-Net
-    embeddings_A = unet_model.predict(patches_A)
-    embeddings_B = unet_model.predict(patches_B)
-    
-    # Compare embeddings and generate black-and-white heatmaps
-    heatmaps = []
-    for i in range(len(embeddings_A)):
-        diff_vector = embeddings_A[i] - embeddings_B[i]
-        heatmap = generate_heatmap(diff_vector, patch_size, threshold)
-        heatmaps.append(heatmap)
-    
-    # Stitch all patch heatmaps into one large heatmap
-    full_heatmap = stitch_heatmaps(heatmaps, image_A.shape[:2], patch_size)
-    
-    return full_heatmap
-
-# Visualization function to show heatmap overlayed on image
-
-def resize_heatmap(heatmap, target_size=(, )):
-    resized_heatmap = cv2.resize(heatmap, target_size, interpolation=cv2.INTER_AREA)
-    return resized_heatmap
-
-def resize_image(image, target_size=(, )):
-    # Resize the image to a smaller size (e.g., 1000x1000) for visualization
-    resized_image = cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
-    return resized_image
-
-
-def visualize_heatmap(image, heatmap, alpha=0.5, dpi=300):
-    
-    resized_image_A = resize_image(image, target_size=(, ))
-    resized_heatmap = resize_heatmap(heatmap, target_size=(, ))
-
-    
-    
-    plt.figure(figsize=(20, 20), dpi=dpi)
-    
-    # Show the original image in grayscale
-    plt.imshow(resized_image_A, cmap='gray')
-    
-    # Overlay the heatmap using a gradient colormap (e.g., 'hot', 'jet')
-    plt.imshow(resized_heatmap, cmap='hot', alpha=alpha)  # Use a gradient colormap
-    
-    plt.colorbar()  # Optionally show a colorbar to indicate intensity
-    plt.axis('off')  # Turn off axis to focus on the image
+    plt.subplot(1, 2, 2)
+    plt.title("Filtered Heatmap (Connected Components)")
+    plt.imshow(cv2.resize(image, target_size))
+    plt.imshow(cv2.resize(filtered_heatmap, target_size), cmap='hot', alpha=0.5)
+    plt.axis("off")
     
     plt.show()
-    
-    
-    plt.figure(figsize=(20, 20), dpi=dpi)
-    plt.imshow(resized_heatmap, cmap='gray')  # Display the mask in grayscale (1 for changed, 0 for unchanged)
-    plt.axis('off')  # Hide the axis
-    plt.show() 
 
-# Example usage
-__name__ = "__main__"
-  
-if __name__ == "__main__":
-    # Load two large images
-    image_A = cv2.imread()  # file path
-    image_B = cv2.imread()  # file path
-  
+def save_heatmap(heatmap: np.ndarray, save_path: str, scale_factor: float) -> None:
+    """Save heatmap as image."""
+    new_size = (int(heatmap.shape[1] * scale_factor), int(heatmap.shape[0] * scale_factor))
+    heatmap_resized = cv2.resize(heatmap, new_size)
+    plt.imsave(save_path, heatmap_resized, cmap="hot")
+
+def save_heatmap_overlay(image: np.ndarray, heatmap: np.ndarray, save_path: str, 
+                        target_size: Tuple[int, int]) -> None:
+    """Save heatmap overlay on RGB image."""
+    plt.figure(figsize=(10, 10))
+    plt.imshow(cv2.resize(image, target_size))
+    plt.imshow(cv2.resize(heatmap, target_size), cmap='hot', alpha=0.8)
+    plt.axis("off")
+    plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
+    plt.close()
+
+def save_heatmap_bw(heatmap: np.ndarray, save_path: str, target_size: Tuple[int, int]) -> None:
+    """Save black-and-white heatmap."""
+    plt.figure(figsize=(10, 10))
+    plt.imshow(cv2.resize(heatmap, target_size), cmap='gray')
+    plt.axis("off")
+    plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
+    plt.close()
+
+def process_images(image_a_path: str, image_b_path: str, output_dir: str, 
+                  config: Config, method: str) -> None:
+    """Process image pair and generate heatmaps."""
+    # Load and preprocess images
+    image_a = load_and_preprocess_image(image_a_path)
+    image_b = load_and_preprocess_image(image_b_path)
     
+    # Create patches
+    patches_a = create_patches(image_a, config.patch_size)
+    patches_b = create_patches(image_b, config.patch_size)
     
-    # Ensure the images are in RGB format
-    image_A = cv2.cvtColor(image_A, cv2.COLOR_BGR2RGB)
-    image_B = cv2.cvtColor(image_B, cv2.COLOR_BGR2RGB)
-
-    # Parameters
-    patch_size = 250
-
-    # Create patches from both images
-    patches_A = create_patches(image_A, patch_size)
-    patches_B = create_patches(image_B, patch_size)
-
-    # Build the U-Net model
-    input_shape = (patch_size, patch_size, 3)
+    # Build and process with U-Net
+    input_shape = (config.patch_size, config.patch_size, 3)
     unet_model = build_unet(input_shape)
-
-    # Extract feature embeddings for each patch using U-Net
-    embeddings_A = unet_model.predict(patches_A)
-    embeddings_B = unet_model.predict(patches_B)
-
-    # Compare embeddings and generate heatmaps
-    heatmaps = []
-    for i in range(len(embeddings_A)):
-        diff_vector = np.abs(embeddings_A[i] - embeddings_B[i])
-        heatmap = generate_heatmap(diff_vector, patch_size)
-        heatmaps.append(heatmap)
+    embeddings_a = unet_model.predict(patches_a)
+    embeddings_b = unet_model.predict(patches_b)
     
-    # Stitch all patch heatmaps into one large heatmap
-    full_heatmap = stitch_heatmaps(heatmaps, image_A.shape[:2], patch_size)
+    # Generate heatmaps
+    heatmaps = [
+        generate_heatmap(
+            np.abs(embeddings_a[i] - embeddings_b[i]),
+            config.patch_size,
+            config.threshold
+        )
+        for i in range(len(embeddings_a))
+    ]
+    
+    # Stitch and filter heatmaps
+    full_heatmap = stitch_heatmaps(heatmaps, image_a.shape[:2], config.patch_size)
+    filtered_heatmap = apply_connected_components_filter(full_heatmap, config.min_area)
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save results
+    save_heatmap(full_heatmap, os.path.join(output_dir, f"{method}_heatmap.png"), config.scale_factor)
+    save_heatmap(filtered_heatmap, os.path.join(output_dir, f"{method}_filtered_heatmap.png"), config.scale_factor)
+    save_heatmap_overlay(image_a, full_heatmap, os.path.join(output_dir, f"{method}_heatmap_overlay.png"), config.target_size)
+    save_heatmap_overlay(image_a, filtered_heatmap, os.path.join(output_dir, f"{method}_filtered_heatmap_overlay.png"), config.target_size)
+    save_heatmap_bw(full_heatmap, os.path.join(output_dir, f"{method}_heatmap_bw.png"), config.target_size)
+    save_heatmap_bw(filtered_heatmap, os.path.join(output_dir, f"{method}_filtered_heatmap_bw.png"), config.target_size)
+    
+    # Visualize results
+    visualize_both_heatmaps(image_a, full_heatmap, filtered_heatmap, config.target_size)
 
-    # Visualize the heatmap over the original image
-    visualize_heatmap(image_A, full_heatmap)
+def main():
+    """Main function with command-line interface."""
+    parser = argparse.ArgumentParser(description="Siamese U-Net for RGB Image Difference Detection")
+    parser.add_argument("--image_a", required=True, help="Path to first input image")
+    parser.add_argument("--image_b", required=True, help="Path to second input image")
+    parser.add_argument("--output_dir", required=True, help="Output directory for results")
+    parser.add_argument("--method", choices=["kmean", "DBSCAN", "GMM", "AGG"], 
+                       default="kmean", help="Clustering method")
+    parser.add_argument("--patch_size", type=int, default=200, help="Patch size for processing")
+    parser.add_argument("--threshold", type=float, default=0.01, help="Threshold for heatmap generation")
+    
+    args = parser.parse_args()
+    
+    # Initialize configuration
+    config = Config(
+        patch_size=args.patch_size,
+        threshold=args.threshold
+    )
+    
+    # Set up environment
+    set_seed(config.seed)
+    configure_gpu(config)
+    
+    # Process images
+    process_images(args.image_a, args.image_b, args.output_dir, config, args.method)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+if __name__ == "__main__":
+    main()
