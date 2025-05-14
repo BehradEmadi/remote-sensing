@@ -1,0 +1,141 @@
+# kmeans_green_clustering.py
+"""
+K-means Clustering on Green Channel for Image Segmentation
+
+This script applies MiniBatchKMeans clustering on the green channel of two RGB images
+to segment them based on intensity. Optimized for speed with 16 clusters and progress tracking.
+
+Author: Behrad
+License: MIT
+"""
+
+import numpy as np
+import cv2
+from sklearn.cluster import MiniBatchKMeans
+import argparse
+from typing import Tuple
+from dataclasses import dataclass
+
+@dataclass
+class Config:
+    """Configuration class for clustering parameters."""
+    n_clusters: int = 16
+    n_init: int = 20
+    batch_size: int = 10000
+    random_state: int = 0
+    verbose: int = 1
+
+def apply_kmeans_on_combined_green(image_a: np.ndarray, image_b: np.ndarray, 
+                                 config: Config) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Apply K-means clustering on combined green channels of two images.
+
+    Args:
+        image_a: First input RGB image (height, width, 3).
+        image_b: Second input RGB image (height, width, 3).
+        config: Configuration object with clustering parameters.
+    
+    Returns:
+        Tuple of segmented RGB images (uint8) for both inputs.
+    """
+    # Extract green channels and flatten
+    green_a = image_a[:, :, 1].ravel()  # Shape: (height*width,)
+    green_b = image_b[:, :, 1].ravel()  # Shape: (height*width,)
+    
+    # Combine green channels
+    combined_green = np.concatenate([green_a, green_b]).reshape(-1, 1)
+    
+    # Apply MiniBatchKMeans
+    model = MiniBatchKMeans(
+        n_clusters=config.n_clusters,
+        random_state=config.random_state,
+        n_init=config.n_init,
+        batch_size=config.batch_size,
+        verbose=config.verbose
+    ).fit(combined_green)
+    
+    # Split labels
+    n_pixels_a = len(green_a)
+    labels_a = model.labels_[:n_pixels_a]
+    labels_b = model.labels_[n_pixels_a:]
+    
+    # Map labels to centroid values
+    centroids = model.cluster_centers_
+    clustered_values_a = centroids[labels_a].flatten()
+    clustered_values_b = centroids[labels_b].flatten()
+    
+    # Reshape to original dimensions
+    height, width = image_a.shape[:2]
+    segmented_image_a_2d = clustered_values_a.reshape(height, width)
+    segmented_image_b_2d = clustered_values_b.reshape(height, width)
+    
+    # Convert to 3-channel RGB
+    segmented_image_a = np.stack([segmented_image_a_2d] * 3, axis=-1)
+    segmented_image_b = np.stack([segmented_image_b_2d] * 3, axis=-1)
+    
+    return np.uint8(segmented_image_a), np.uint8(segmented_image_b)
+
+def load_image(file_path: str) -> np.ndarray:
+    """
+    Load and convert image from BGR to RGB.
+
+    Args:
+        file_path: Path to image file.
+    
+    Returns:
+        RGB image array.
+    
+    Raises:
+        FileNotFoundError: If image cannot be loaded.
+    """
+    image = cv2.imread(file_path)
+    if image is None:
+        raise FileNotFoundError(f"Could not load image from {file_path}")
+    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+def save_image(image: np.ndarray, file_path: str) -> None:
+    """
+    Save RGB image after converting to BGR.
+
+    Args:
+        image: RGB image array.
+        file_path: Output path for saving image.
+    """
+    cv2.imwrite(file_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+
+def main():
+    """Main function with command-line interface."""
+    parser = argparse.ArgumentParser(
+        description="K-means clustering on green channel for image segmentation"
+    )
+    parser.add_argument("--image_a", required=True, help="Path to first input image")
+    parser.add_argument("--image_b", required=True, help="Path to second input image")
+    parser.add_argument("--output_a", required=True, help="Output path for segmented image A")
+    parser.add_argument("--output_b", required=True, help="Output path for segmented image B")
+    parser.add_argument("--n_clusters", type=int, default=16, help="Number of clusters")
+    parser.add_argument("--n_init", type=int, default=20, help="Number of K-means iterations")
+    parser.add_argument("--batch_size", type=int, default=10000, help="Batch size for MiniBatchKMeans")
+    
+    args = parser.parse_args()
+    
+    # Initialize configuration
+    config = Config(
+        n_clusters=args.n_clusters,
+        n_init=args.n_init,
+        batch_size=args.batch_size
+    )
+    
+    # Load images
+    image_a = load_image(args.image_a)
+    image_b = load_image(args.image_b)
+    
+    # Apply clustering
+    segmented_a, segmented_b = apply_kmeans_on_combined_green(image_a, image_b, config)
+    
+    # Save results
+    save_image(segmented_a, args.output_a)
+    save_image(segmented_b, args.output_b)
+    print(f"Segmented images saved to {args.output_a} and {args.output_b}")
+
+if __name__ == "__main__":
+    main()
