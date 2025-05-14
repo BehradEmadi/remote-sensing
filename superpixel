@@ -1,0 +1,81 @@
+"""
+High-Quality Superpixel Segmentation Using Felzenszwalb Algorithm
+
+This script loads two input images, applies bilateral filtering, and performs
+Felzenszwalb superpixel segmentation. Each superpixel is filled with its median color,
+and the results are sharpened and saved.
+
+Author: Behrad Emadi
+Date: March 2025
+"""
+
+import os
+import cv2
+import numpy as np
+from skimage.segmentation import felzenszwalb
+
+
+def load_and_preprocess_image(path, crop_ratio=0.5):
+    """Load and preprocess an image: convert to RGB, crop, and apply bilateral filter."""
+    image = cv2.imread(path)
+    if image is None:
+        raise FileNotFoundError(f"Failed to load image: {path}")
+    
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    height, width = image.shape[:2]
+    image = image[:int(height * crop_ratio), :int(width * crop_ratio)]
+    image = cv2.bilateralFilter(image, d=9, sigmaColor=75, sigmaSpace=75)
+    return image
+
+
+def segment_and_color(image, scale=50, sigma=0.8, min_size=20):
+    """Segment image with Felzenszwalb and fill segments with median color."""
+    segments = felzenszwalb(image, scale=scale, sigma=sigma, min_size=min_size)
+    output = np.zeros_like(image, dtype=np.float32)
+    
+    for label in np.unique(segments):
+        mask = (segments == label)
+        if np.any(mask):
+            median_color = np.median(image[mask], axis=0)
+            output[mask] = median_color
+    
+    return output.astype(np.uint8)
+
+
+def apply_sharpening(image):
+    """Apply a sharpening filter to enhance edges."""
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5, -1],
+                       [0, -1, 0]])
+    return cv2.filter2D(image, -1, kernel)
+
+
+def process_images(image_a_path, image_b_path, output_dir="results"):
+    """Main processing pipeline for both images."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    image_a = load_and_preprocess_image(image_a_path)
+    image_b = load_and_preprocess_image(image_b_path)
+
+    colored_a = segment_and_color(image_a)
+    colored_b = segment_and_color(image_b)
+
+    colored_a = apply_sharpening(colored_a)
+    colored_b = apply_sharpening(colored_b)
+
+    # Save output images (convert back to BGR for OpenCV)
+    output_a_path = os.path.join(output_dir, "colored_superpixels_A.tif")
+    output_b_path = os.path.join(output_dir, "colored_superpixels_B.tif")
+
+    cv2.imwrite(output_a_path, cv2.cvtColor(colored_a, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(output_b_path, cv2.cvtColor(colored_b, cv2.COLOR_RGB2BGR))
+
+    print(f"Image A saved to: {output_a_path}")
+    print(f"Image B saved to: {output_b_path}")
+
+
+if __name__ == "__main__":
+    # Replace these with your own relative paths or arguments
+    image_A_path = "input/image_A.tif"
+    image_B_path = "input/image_B.tif"
+    process_images(image_A_path, image_B_path)
