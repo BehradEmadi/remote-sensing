@@ -1,0 +1,128 @@
+# create_4channel_image.py
+"""
+Create 4-Channel Images from RGB and K-means Segmentation
+
+This script combines RGB images with K-means segmentation maps to create 4-channel images,
+saved as NumPy arrays. It supports batch processing of image pairs for use in Siamese U-Net.
+
+Author: Behrad
+License: MIT
+"""
+
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import argparse
+import os
+from typing import Tuple
+
+def load_and_validate_image(rgb_path: str, kmeans_path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load RGB and K-means segmentation images, ensuring compatibility.
+
+    Args:
+        rgb_path: Path to RGB image file.
+        kmeans_path: Path to K-means segmentation image file.
+
+    Returns:
+        Tuple of (RGB image, K-means image).
+
+    Raises:
+        FileNotFoundError: If either image file cannot be loaded.
+        ValueError: If images are incompatible or have incorrect channels.
+    """
+    # Load images
+    rgb_image = cv2.imread(rgb_path)
+    kmeans_image = cv2.imread(kmeans_path, cv2.IMREAD_GRAYSCALE)
+
+    if rgb_image is None:
+        raise FileNotFoundError(f"Could not load RGB image from {rgb_path}")
+    if kmeans_image is None:
+        raise FileNotFoundError(f"Could not load K-means image from {kmeans_path}")
+
+    # Validate RGB image channels
+    if rgb_image.shape[2] != 3:
+        raise ValueError(f"RGB image must have 3 channels, got {rgb_image.shape[2]}")
+
+    # Resize RGB to match K-means dimensions
+    kmeans_image = np.expand_dims(kmeans_image, axis=-1)  # Ensure (H, W, 1)
+    rgb_image = cv2.resize(rgb_image, (kmeans_image.shape[1], kmeans_image.shape[0]))
+
+    return rgb_image, kmeans_image
+
+def create_4channel_image(rgb_image: np.ndarray, kmeans_image: np.ndarray) -> np.ndarray:
+    """
+    Combine RGB and K-means images into a 4-channel image.
+
+    Args:
+        rgb_image: RGB image (H, W, 3).
+        kmeans_image: K-means segmentation image (H, W, 1).
+
+    Returns:
+        4-channel image (H, W, 4).
+    """
+    return np.concatenate((rgb_image, kmeans_image), axis=-1)
+
+def visualize_rgb(image: np.ndarray, title: str) -> None:
+    """
+    Display RGB channels of an image.
+
+    Args:
+        image: Image array (H, W, 3 or 4).
+        title: Title for the plot.
+    """
+    plt.figure(figsize=(10, 10))
+    plt.imshow(cv2.cvtColor(image[:, :, :3], cv2.COLOR_BGR2RGB))  # Convert BGR to RGB for display
+    plt.axis("off")
+    plt.title(title)
+    plt.show()
+
+def process_image_pair(rgb_path: str, kmeans_path: str, output_path: str, 
+                      visualize: bool = False) -> None:
+    """
+    Process a pair of RGB and K-means images to create and save a 4-channel image.
+
+    Args:
+        rgb_path: Path to RGB image.
+        kmeans_path: Path to K-means segmentation image.
+        output_path: Path to save 4-channel NumPy array.
+        visualize: Whether to display the RGB view.
+    """
+    # Load and validate images
+    rgb_image, kmeans_image = load_and_validate_image(rgb_path, kmeans_path)
+
+    # Create 4-channel image
+    merged_image = create_4channel_image(rgb_image, kmeans_image)
+
+    # Save as NumPy array
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    np.save(output_path, merged_image)
+    print(f"Saved 4-channel image to {output_path}")
+
+    # Visualize if requested
+    if visualize:
+        visualize_rgb(merged_image, f"RGB View of 4-Channel Image: {os.path.basename(output_path)}")
+
+def main():
+    """Main function with command-line interface."""
+    parser = argparse.ArgumentParser(
+        description="Create 4-channel images from RGB and K-means segmentation maps"
+    )
+    parser.add_argument("--rgb_a", required=True, help="Path to RGB image A")
+    parser.add_argument("--kmeans_a", required=True, help="Path to K-means segmentation image A")
+    parser.add_argument("--output_a", required=True, help="Output path for 4-channel image A (.npy)")
+    parser.add_argument("--rgb_b", required=True, help="Path to RGB image B")
+    parser.add_argument("--kmeans_b", required=True, help="Path to K-means segmentation image B")
+    parser.add_argument("--output_b", required=True, help="Output path for 4-channel image B (.npy)")
+    parser.add_argument("--visualize", action="store_true", help="Visualize RGB channels of output images")
+
+    args = parser.parse_args()
+
+    # Process image pair A
+    process_image_pair(args.rgb_a, args.kmeans_a, args.output_a, args.visualize)
+
+    # Process image pair B
+    process_image_pair(args.rgb_b, args.kmeans_b, args.output_b, args.visualize)
+
+if __name__ == "__main__":
+    main()
